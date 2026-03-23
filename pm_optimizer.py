@@ -192,8 +192,7 @@ def compute_allowed_starts(plan_names, plan_intervals_weeks, num_weeks,
     for plan_name in plan_names:
         ivals      = plan_intervals_weeks[plan_name]   # float tensor
         min_step   = ivals.min().item()
-        max_start  = min(int(np.ceil(min_step)), num_weeks)
-        candidates = list(range(1 - 4, max_start + 1))
+        candidates = list(range(1, int(np.ceil(min_step)) + 1))
         good       = []
 
         for s in candidates:
@@ -309,6 +308,12 @@ def run_ga(df, plan_col, interval_col, unit_col, work_col,
         elite     = select_elite(solutions, fitness, elite_count)
         solutions = crossover(elite, population_size, crossover_rate, device)
         solutions = mutate_plans(solutions, plan_names, allowed_tensors, mutation_rate, device)
+
+    if best_solution is None:
+        raise ValueError(
+            "Optimization produced no valid solution. "
+            "Check the work column for NaN or blank values."
+        )
 
     # ── Reconstruct final workload from best solution ─────────────────────────
     final_workload = torch.zeros(num_weeks, device=device)
