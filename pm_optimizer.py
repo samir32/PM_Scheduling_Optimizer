@@ -216,7 +216,7 @@ def compute_allowed_starts(plan_names, plan_intervals_weeks, num_weeks,
     for plan_name in plan_names:
         ivals      = plan_intervals_weeks[plan_name]   # float tensor
         min_step   = ivals.min().item()
-        candidates = list(range(1, int(np.ceil(min_step)) + 1))
+        candidates = list(range(1, min(int(np.ceil(min_step)), num_weeks) + 1))
         good       = []
 
         for s in candidates:
