@@ -108,7 +108,8 @@ def parse_work_cell(val, global_work_unit: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_vectorized(solutions, plan_list, plan_intervals_weeks, plan_work,
-                        num_weeks, device, forbidden_weeks_tensor, restriction_weight):
+                        num_weeks, device, forbidden_weeks_tensor, restriction_weight,
+                        priority_plan_ops, target_weeks_tensor, priority_miss_penalty):
     """
     Fully-vectorised fitness evaluation.
     plan_intervals_weeks values are float tensors (weeks, possibly fractional).
@@ -146,7 +147,30 @@ def evaluate_vectorized(solutions, plan_list, plan_intervals_weeks, plan_work,
 
     max_w = weighted.max(dim=1).values
     min_w = weighted.min(dim=1).values
-    return max_w * 10_000 + (max_w - min_w)
+    base  = max_w * 10_000 + (max_w - min_w)
+
+    if not priority_plan_ops or target_weeks_tensor.numel() == 0:
+        return base
+
+    miss = torch.zeros(pop_size, device=device)
+    for j, op_indices in priority_plan_ops.items():
+        plan_name = plan_list[j]
+        starts    = solutions[:, j].float() - 1.0
+        hit       = torch.zeros(pop_size, dtype=torch.bool, device=device)
+        for i_op in op_indices:
+            step = plan_intervals_weeks[plan_name][i_op].item()
+            if step <= 0:
+                continue
+            max_occ = int(np.ceil((num_weeks - starts.min().item()) / step)) + 1
+            k       = torch.arange(0, max_occ, device=device, dtype=torch.float32)
+            occ_f   = starts.unsqueeze(1) + k.unsqueeze(0) * step          # (pop, max_occ)
+            occ     = occ_f.round().long()
+            valid   = (occ >= 0) & (occ < num_weeks)
+            in_tgt  = (occ.unsqueeze(2) == target_weeks_tensor.view(1, 1, -1)).any(dim=2)
+            hit    |= (in_tgt & valid).any(dim=1)
+        miss += (~hit).float()
+
+    return base + miss * priority_miss_penalty
 
 
 def select_elite(solutions, fitness, elite_count):
@@ -225,6 +249,8 @@ def run_ga(df, plan_col, interval_col, unit_col, work_col,
            elite_fraction, mutation_rate, crossover_rate,
            use_restrictions, restricted_interval_weeks, forbidden_weeks,
            restriction_weight, device_str,
+           use_priority, priority_intervals_weeks, priority_min_work,
+           target_weeks, priority_miss_penalty,
            progress_bar, status_text):
 
     device       = torch.device(device_str)
@@ -271,6 +297,30 @@ def run_ga(df, plan_col, interval_col, unit_col, work_col,
         else torch.tensor([], dtype=torch.long, device=device)
     )
 
+    tw_tensor = (
+        torch.tensor([w - 1 for w in target_weeks if 0 <= w - 1 < num_weeks],
+                     dtype=torch.long, device=device)
+        if use_priority and target_weeks
+        else torch.tensor([], dtype=torch.long, device=device)
+    )
+
+    priority_plan_ops = {}
+    if use_priority:
+        for j, name in enumerate(plan_names):
+            ivals      = plan_intervals_weeks[name]
+            works      = plan_work[name]
+            qualifying = []
+            for i_op in range(len(ivals)):
+                step = ivals[i_op].item()
+                wh   = works[i_op].item()
+                i_ok = (not priority_intervals_weeks or
+                        any(abs(step - pi) < 0.01 for pi in priority_intervals_weeks))
+                w_ok = wh >= priority_min_work
+                if i_ok and w_ok:
+                    qualifying.append(i_op)
+            if qualifying:
+                priority_plan_ops[j] = qualifying
+
     allowed_starts = compute_allowed_starts(
         plan_names, plan_intervals_weeks, num_weeks,
         use_restrictions, restricted_interval_weeks, fw_tensor, device)
@@ -292,7 +342,8 @@ def run_ga(df, plan_col, interval_col, unit_col, work_col,
     for gen in range(generations):
         fitness = evaluate_vectorized(
             solutions, plan_names, plan_intervals_weeks, plan_work,
-            num_weeks, device, fw_tensor, restriction_weight)
+            num_weeks, device, fw_tensor, restriction_weight,
+            priority_plan_ops, tw_tensor, priority_miss_penalty)
 
         min_f = fitness.min().item()
         fitness_history.append(min_f)
@@ -400,6 +451,17 @@ def main():
             min_value=1.0, max_value=100.0, value=5.0, step=0.5,
             disabled=not use_restrictions,
             help="Multiplier applied to workload falling in forbidden weeks during fitness scoring")
+
+        st.divider()
+        st.subheader("🎯 Priority Scheduling")
+        use_priority = st.checkbox(
+            "Enable Priority Scheduling", value=False,
+            help="Attract selected PMs toward target weeks (e.g. plant shutdowns)")
+        priority_miss_penalty = st.number_input(
+            "Priority Miss Penalty",
+            min_value=1_000, max_value=1_000_000, value=50_000, step=1_000,
+            disabled=not use_priority,
+            help="Added to fitness for each priority plan with no occurrence in a target week")
 
     # ── Step 1 — Upload ───────────────────────────────────────────────────────
     st.header("Step 1 — Load Data")
@@ -514,6 +576,9 @@ def main():
     # ── Step 3 — Restrictions (optional) ─────────────────────────────────────
     restricted_interval_weeks = set()
     forbidden_weeks           = []
+    target_weeks              = []
+    priority_intervals_weeks  = set()
+    priority_min_work         = 0.0
 
     if df is not None and col_ok and use_restrictions:
         st.header("Step 3 — Restrictions")
@@ -565,8 +630,88 @@ def main():
                 st.plotly_chart(fig_fw, use_container_width=True)
                 st.caption(f"{len(forbidden_weeks)} forbidden weeks selected")
 
+    # ── Priority Scheduling step (optional) ──────────────────────────────────
+    if df is not None and col_ok and use_priority:
+        priority_step_n = 3 + (1 if use_restrictions else 0)
+        st.header(f"Step {priority_step_n} — Priority Scheduling")
+        st.caption(
+            "Select which PMs should be pulled toward target weeks (e.g. plant shutdowns). "
+            "A plan qualifies if it has at least one operation matching the interval "
+            "and work criteria below.")
+        pc1, pc2, pc3 = st.columns([1, 1, 2])
+
+        with pc1:
+            st.subheader("Intervals to prioritize")
+            st.caption("Leave empty to match all intervals.")
+            if interval_col:
+                try:
+                    cols_to_use = [interval_col] + ([unit_col] if unit_col else [])
+                    p_rows = df[cols_to_use].dropna().drop_duplicates().copy()
+
+                    def _p_to_weeks(r):
+                        fb = normalise_unit(r[unit_col]) if unit_col else "week"
+                        num, u = parse_interval_cell(r[interval_col], fb or "week")
+                        return interval_to_weeks(num, u, days_per_week, weeks_per_month, weeks_per_year)
+
+                    p_rows["_weeks"] = p_rows.apply(_p_to_weeks, axis=1)
+                    p_rows["_label"] = p_rows.apply(
+                        lambda r: f"{r[interval_col]}  ({r['_weeks']:.2f} wks)", axis=1)
+                    p_rows = p_rows.sort_values("_weeks")
+                    p_label_map = dict(zip(p_rows["_label"], p_rows["_weeks"]))
+                    p_selected  = st.multiselect(
+                        "Intervals:", options=list(p_label_map.keys()))
+                    priority_intervals_weeks = {p_label_map[l] for l in p_selected}
+                except Exception as e:
+                    st.warning(f"Could not build interval list: {e}")
+
+        with pc2:
+            st.subheader("Minimum work (h)")
+            priority_min_work = st.number_input(
+                "Min work per occurrence", min_value=0.0, value=0.0, step=0.5,
+                help="Operations with work below this threshold are excluded. 0 = no filter.")
+
+            if df is not None and interval_col and work_col and plan_col:
+                try:
+                    n_match = 0
+                    for _, grp in df.groupby(plan_col):
+                        for _, row in grp.iterrows():
+                            fb     = normalise_unit(row[unit_col]) if unit_col else "week"
+                            num, u = parse_interval_cell(row[interval_col], fb or "week")
+                            sw     = interval_to_weeks(num, u, float(days_per_week),
+                                                       float(weeks_per_month), float(weeks_per_year))
+                            wh     = parse_work_cell(row[work_col], work_unit)
+                            i_ok   = (not priority_intervals_weeks or
+                                      any(abs(sw - pi) < 0.01 for pi in priority_intervals_weeks))
+                            if i_ok and wh >= priority_min_work:
+                                n_match += 1
+                                break
+                    st.metric("Matching plans", n_match)
+                except Exception:
+                    pass
+
+        with pc3:
+            st.subheader("Target weeks")
+            all_weeks_p  = list(range(1, int(num_weeks) + 1))
+            target_weeks = st.multiselect(
+                "Weeks where priority PMs should be scheduled:", options=all_weeks_p)
+
+            if target_weeks:
+                tw_arr = [1 if w in set(target_weeks) else 0 for w in all_weeks_p]
+                fig_tw = go.Figure(go.Bar(
+                    x=all_weeks_p, y=tw_arr,
+                    marker_color=["#2ecc71" if v else "#ecf0f1" for v in tw_arr],
+                    hovertemplate="Week %{x}<extra></extra>", showlegend=False))
+                fig_tw.update_layout(
+                    height=130, margin=dict(l=0, r=0, t=10, b=0),
+                    yaxis=dict(visible=False), xaxis_title="Week",
+                    template="plotly_white")
+                st.plotly_chart(fig_tw, use_container_width=True)
+                st.caption(f"{len(target_weeks)} target weeks selected")
+
     # ── Run ───────────────────────────────────────────────────────────────────
-    step_n = 4 if (use_restrictions and col_ok and df is not None) else 3
+    step_n = (3
+              + (1 if (use_restrictions and col_ok and df is not None) else 0)
+              + (1 if (use_priority     and col_ok and df is not None) else 0))
     st.header(f"Step {step_n} — Run")
 
     if not (df is not None and col_ok):
@@ -603,6 +748,11 @@ def main():
                 forbidden_weeks=list(forbidden_weeks),
                 restriction_weight=float(restriction_weight),
                 device_str=device_str,
+                use_priority=use_priority,
+                priority_intervals_weeks=priority_intervals_weeks,
+                priority_min_work=float(priority_min_work),
+                target_weeks=list(target_weeks),
+                priority_miss_penalty=float(priority_miss_penalty),
                 progress_bar=progress_bar,
                 status_text=status_text,
             )
